@@ -1,4 +1,4 @@
-# Rivus: Ultimate Security Audit Script
+# Rivus: Ultimate Git Security Audit Script
 
 **Published by Oob Skulden™**
 
@@ -1495,9 +1495,11 @@ Report privately to: security@oobskulden.com
 
 ## Acknowledgments
 
-Rivus builds on lessons from real-world incidents, open-source security tooling (gitleaks, detect-secrets, git-secrets), OWASP guidance, and practitioner feedback.
+Rivus draws from real-world incidents, open-source security tooling (gitleaks, detect-secrets, git-secrets), OWASP guidance, and practitioner experience.
 
-Special thanks to the gitleaks, detect-secrets, and git-secrets projects, and to the static site generator communities.
+The tool emerged organically while securing and publishing a **production static website** https://oobskulden.com , where recurring risks and overlooked edge cases shaped its scope and checks over time.
+
+Special thanks to the gitleaks, detect-secrets, and git-secrets projects, and to the static site generator communities whose work and lessons helped inform Rivus.
 
 -----
 
