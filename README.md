@@ -546,7 +546,7 @@ Keep it fast. Keep it local. Keep it honest.
 ## License
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![GitHub stars](https://img.shields.io/github/stars/YOUR_USERNAME/YOUR_REPO_NAME)](https://github.com/YOUR_USERNAME/YOUR_REPO_NAME/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/oob-skulden/zimara)](https://github.com/oob-skulden/zimara/stargazers)
 
 AGPL-3.0 License — see LICENSE file.
 
