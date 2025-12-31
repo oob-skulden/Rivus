@@ -28,7 +28,7 @@ if [[ ":${_ORIG_PATH}:" == *":.:"* ]]; then
   echo "  Detected '.' in original PATH; ignoring it for this run (command hijack mitigation)."
 fi
 
-VERSION="0.47.1"
+VERSION="0.48.0"
 
 # -----------------------------
 # Colors
@@ -38,6 +38,7 @@ GREEN="\033[0;32m"
 YELLOW="\033[0;33m"
 BLUE="\033[0;34m"
 PURPLE="\033[0;35m"
+CYAN="\033[0;36m"
 NC="\033[0m"
 
 # -----------------------------
@@ -48,6 +49,11 @@ NON_INTERACTIVE=0
 ONLY_OUTPUT=0
 VERBOSE=0
 TRACE_CHECKS=0
+
+# Snippet configuration
+SNIPPET_CONTEXT_LINES=3
+SNIPPET_MAX_LINE_LENGTH=120
+SNIPPET_SHOW_PATTERN=1
 
 # Findings counters
 CRITICAL=0
@@ -163,6 +169,237 @@ safe_grep() {
   grep_cmd "$@" 2>/dev/null || true
 }
 
+# ============================================
+# .zimaraignore Security & Validation
+# ============================================
+
+# Configuration
+MAX_IGNORE_PATTERNS=100
+MAX_PATTERN_LENGTH=200
+SAFE_PATTERN_REGEX='^[a-zA-Z0-9._/*-]+$'
+
+# Global arrays to hold validated patterns and constructed exclusions
+IGNORE_PATTERNS=()
+GREP_EXCLUDES=()
+FIND_EXCLUDES=()
+
+validate_ignore_pattern() {
+  local pattern="$1"
+  
+  # Length check
+  if [[ "${#pattern}" -gt "$MAX_PATTERN_LENGTH" ]]; then
+    sayc "${RED} WARNING: .zimaraignore pattern exceeds ${MAX_PATTERN_LENGTH} chars (truncated): ${pattern:0:50}...${NC}" >&2
+    return 1
+  fi
+  
+  # Character whitelist (strict): alphanumeric, dot, slash, dash, underscore, asterisk ONLY
+  if [[ ! "$pattern" =~ $SAFE_PATTERN_REGEX ]]; then
+    sayc "${RED} WARNING: .zimaraignore invalid pattern (only a-z A-Z 0-9 . / - _ * allowed): ${pattern}${NC}" >&2
+    return 1
+  fi
+  
+  # Reject argument injection vectors
+  if [[ "$pattern" =~ ^- ]]; then
+    sayc "${RED} WARNING: .zimaraignore pattern cannot start with '-' (argument injection): ${pattern}${NC}" >&2
+    return 1
+  fi
+  
+  # Reject path traversal
+  if [[ "$pattern" =~ \.\. ]]; then
+    sayc "${RED} WARNING: .zimaraignore path traversal not allowed (..): ${pattern}${NC}" >&2
+    return 1
+  fi
+  
+  # Reject absolute paths
+  if [[ "$pattern" =~ ^/ ]]; then
+    sayc "${RED} WARNING: .zimaraignore absolute paths not allowed: ${pattern}${NC}" >&2
+    return 1
+  fi
+  
+  # Warn on overly broad patterns (but allow them)
+  case "$pattern" in
+    "*"|"*/*"|"*.*"|".")
+      sayc "${YELLOW} WARNING: Very broad pattern may disable important checks: ${pattern}${NC}" >&2
+      ;;
+  esac
+  
+  return 0
+}
+
+load_zimaraignore() {
+  IGNORE_PATTERNS=()
+  
+  if [[ ! -f ".zimaraignore" ]]; then
+    return 0
+  fi
+  
+  sayc "${BLUE} Loading .zimaraignore${NC}"
+  
+  local line pattern count=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip leading/trailing whitespace
+    pattern="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    
+    # Skip empty lines and comments
+    [[ -z "$pattern" || "$pattern" =~ ^# ]] && continue
+    
+    # Enforce maximum pattern count
+    if [[ "$count" -ge "$MAX_IGNORE_PATTERNS" ]]; then
+      sayc "${YELLOW} WARNING: Maximum ${MAX_IGNORE_PATTERNS} patterns reached, ignoring remaining lines${NC}" >&2
+      break
+    fi
+    
+    # Validate and add
+    if validate_ignore_pattern "$pattern"; then
+      IGNORE_PATTERNS+=("$pattern")
+      count=$((count + 1))
+      [[ "$VERBOSE" -eq 1 ]] && say "   [${count}] ${pattern}"
+    fi
+  done < ".zimaraignore"
+  
+  if [[ "${#IGNORE_PATTERNS[@]}" -gt 0 ]]; then
+    sayc "${GREEN} Loaded ${#IGNORE_PATTERNS[@]} valid pattern(s) from .zimaraignore${NC}"
+  fi
+  say ""
+}
+
+build_grep_excludes() {
+  GREP_EXCLUDES=()
+  for pattern in "${IGNORE_PATTERNS[@]}"; do
+    GREP_EXCLUDES+=("--exclude=${pattern}")
+  done
+}
+
+build_find_prunes() {
+  FIND_EXCLUDES=()
+  for pattern in "${IGNORE_PATTERNS[@]}"; do
+    # Convert glob patterns to find-compatible expressions
+    case "$pattern" in
+      */*)
+        # Path-based pattern: use -path
+        FIND_EXCLUDES+=("-path" "./${pattern}" "-prune" "-o")
+        ;;
+      *.*)
+        # Extension-based pattern: use -name
+        FIND_EXCLUDES+=("-name" "${pattern}" "-prune" "-o")
+        ;;
+      *)
+        # Generic pattern: use -name
+        FIND_EXCLUDES+=("-name" "${pattern}" "-prune" "-o")
+        ;;
+    esac
+  done
+}
+
+# ============================================
+# Snippet Extraction Functions
+# ============================================
+
+# Extract and display file snippet around a specific line
+# Usage: extract_snippet <file> <line_num> [context_lines]
+extract_snippet() {
+  local file="$1"
+  local target_line="$2"
+  local context="${3:-${SNIPPET_CONTEXT_LINES}}"
+  
+  # Check if file is readable
+  [[ ! -f "$file" || ! -r "$file" ]] && return 1
+  
+  # Check if file appears to be binary
+  if file "$file" 2>/dev/null | grep_cmd -qE 'executable|binary'; then
+    say "  ${CYAN}[BINARY FILE - cannot display snippet]${NC}"
+    return 0
+  fi
+  
+  local start_line=$((target_line - context))
+  local end_line=$((target_line + context))
+  
+  # Bounds checking
+  [[ $start_line -lt 1 ]] && start_line=1
+  
+  # Extract snippet with line numbers
+  local line_num=$start_line
+  local display_line
+  
+  sed -n "${start_line},${end_line}p" "$file" 2>/dev/null | while IFS= read -r line || [[ -n "$line" ]]; do
+    # Truncate very long lines
+    if [[ "${#line}" -gt "$SNIPPET_MAX_LINE_LENGTH" ]]; then
+      display_line="${line:0:$SNIPPET_MAX_LINE_LENGTH}..."
+    else
+      display_line="$line"
+    fi
+    
+    # Highlight the violation line
+    if [[ $line_num -eq $target_line ]]; then
+      printf "${CYAN}>> %4d |${NC} %s\n" "$line_num" "$display_line"
+    else
+      printf "   %4d | %s\n" "$line_num" "$display_line"
+    fi
+    ((line_num++))
+  done
+  
+  return 0
+}
+
+# Get line number where pattern matches (first occurrence)
+# Usage: get_violation_line <file> <pattern>
+# Returns: line number or empty string
+get_violation_line() {
+  local file="$1"
+  local pattern="$2"
+  
+  [[ ! -f "$file" || ! -r "$file" ]] && return 1
+  
+  # Use grep -n to get line number, return first match only
+  grep_cmd -n -E "$pattern" "$file" 2>/dev/null | head -1 | cut -d: -f1 || echo ""
+}
+
+# Report a finding with optional snippet
+# Usage: report_snippet_finding <severity> <title> <file> <pattern> [description]
+report_snippet_finding() {
+  local severity="$1"
+  local title="$2"
+  local file="$3"
+  local pattern="$4"
+  local description="${5:-}"
+  
+  # Get line number
+  local line_num
+  line_num="$(get_violation_line "$file" "$pattern")"
+  
+  if [[ -z "$line_num" ]]; then
+    # Fallback: couldn't determine line (pattern may not match exactly)
+    sayc "  ${YELLOW}${title}${NC}"
+    say "  File: $file"
+    [[ -n "$description" ]] && say "  $description"
+    return 0
+  fi
+  
+  # Print header with file:line format
+  sayc "  ${YELLOW}${title}${NC}"
+  say "  File: ${file}:${line_num}"
+  say "  ────────────────────────────────────────"
+  
+  # Print snippet
+  extract_snippet "$file" "$line_num" "$SNIPPET_CONTEXT_LINES"
+  
+  say "  ────────────────────────────────────────"
+  
+  # Show pattern if enabled
+  if [[ "$SNIPPET_SHOW_PATTERN" -eq 1 ]]; then
+    say "  Pattern: ${pattern}"
+  fi
+  
+  # Show description if provided
+  [[ -n "$description" ]] && say "  ${description}"
+  
+  say ""
+}
+
+# ============================================
+# Finding recording & check execution
+# ============================================
+
 # Record finding with check id + severity, and keep a compact log line
 record_finding() {
   local sev="$1" check_id="$2" msg="$3"
@@ -225,6 +462,8 @@ Options:
   -o, --only-output       Scan only build output (skip source scanning)
   -v, --verbose           More output detail
   --trace-checks          Print ENTER/EXIT markers for each check (debug)
+  --snippet-context N     Lines of context around findings (default: 3)
+  --no-snippet-pattern    Don't show regex patterns in output
   --version               Print version and exit
   -h, --help              Show help
 
@@ -251,6 +490,17 @@ while [[ $# -gt 0 ]]; do
     -o|--only-output) ONLY_OUTPUT=1; shift ;;
     -v|--verbose) VERBOSE=1; shift ;;
     --trace-checks) TRACE_CHECKS=1; shift ;;
+    --snippet-context)
+      shift
+      if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+        SNIPPET_CONTEXT_LINES="$1"
+        shift
+      else
+        sayc "${RED} --snippet-context requires a number${NC}"
+        exit 99
+      fi
+      ;;
+    --no-snippet-pattern) SNIPPET_SHOW_PATTERN=0; shift ;;
     -h|--help) usage; exit 0 ;;
     -*)
       sayc "${RED} Unknown option: $1${NC}"
@@ -316,6 +566,11 @@ detect_generator() {
 
 detect_generator
 
+# Load .zimaraignore patterns immediately after generator detection
+load_zimaraignore
+build_grep_excludes
+build_find_prunes
+
 OUTPUT_SCAN_DIR=""
 [[ -n "${OUTPUT_DIR}" && -d "${OUTPUT_DIR}" ]] && OUTPUT_SCAN_DIR="${OUTPUT_DIR}"
 
@@ -324,6 +579,7 @@ sayc "${PURPLE}Zimara (v${VERSION}) — Published by Oob Skulden™ — generato
 hr
 say "Directory scanned: $(pwd)"
 say "Output dir detected: ${OUTPUT_SCAN_DIR:-"(none)"}"
+say "Snippet context: ${SNIPPET_CONTEXT_LINES} lines"
 say ""
 
 prompt_continue() {
@@ -363,25 +619,37 @@ check_03_private_keys() {
     return 0
   fi
 
-  # Use find -print0 + xargs -0 to handle spaces safely.
-  local hits
-  hits="$(
-    ( find_cmd . \
-        \( -path "./.git" -o -path "./node_modules" -o -path "./vendor" \) -prune -o \
-        -type f -maxdepth 6 -print0 2>/dev/null \
-      | xargs_cmd -0 sh -c 'grep -Il "BEGIN \(RSA\|DSA\|EC\|OPENSSH\) PRIVATE KEY" -- "$1" 2>/dev/null || true' sh \
-    ) | head -n 10
-  )"
+  local pattern='BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY'
+  local tmpf
+  tmpf="$(tmpfile private-keys-hits)"
+  
+  # Find files containing private key blocks
+  find_cmd . \
+    \( -path "./.git" -o -path "./node_modules" -o -path "./vendor" \) -prune -o \
+    "${FIND_EXCLUDES[@]}" \
+    -type f -maxdepth 6 -print0 2>/dev/null \
+    | xargs_cmd -0 grep_cmd -l -E "$pattern" 2>/dev/null > "$tmpf" || true
 
-  if [[ -n "${hits}" ]]; then
-    sayc "${RED}🛑 Private key material detected [CRITICAL]${NC}"
+  if [[ -s "$tmpf" ]]; then
+    sayc "${RED} CRITICAL: Private key material detected${NC}"
     record_finding "CRITICAL" "CHECK 03" "Private key block(s) detected"
-    say "Files:"
-    echo "${hits}"
-    say "Actions:"
-    say "  • Remove keys from repo immediately"
-    say "  • Rotate affected credentials"
-    say "  • Add patterns to .gitignore"
+    say ""
+    
+    # Show snippets for first 5 files
+    local count=0
+    while IFS= read -r file && [[ $count -lt 5 ]]; do
+      report_snippet_finding "CRITICAL" "Private Key in: $file" "$file" "$pattern" \
+        "Action: Remove immediately and rotate credentials"
+      count=$((count + 1))
+    done < "$tmpf"
+    
+    # If more than 5, show count
+    local total
+    total="$(wc -l < "$tmpf" | tr -d ' ')"
+    if [[ $total -gt 5 ]]; then
+      say "  ... and $((total - 5)) more file(s) with private keys"
+      say ""
+    fi
   else
     sayc "${GREEN} No private key blocks found${NC}"
   fi
@@ -393,17 +661,35 @@ check_04_secret_patterns() {
     return 0
   fi
 
-  local hits
-  hits="$(safe_grep -RInE \
+  local pattern='(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{30,}|github_pat_[0-9A-Za-z_]{20,}|AIza[0-9A-Za-z\-_]{35}|-----BEGIN PRIVATE KEY-----|SECRET_KEY=|AWS_SECRET_ACCESS_KEY|BEGIN OPENSSH PRIVATE KEY)'
+  
+  local tmpf
+  tmpf="$(tmpfile secret-patterns)"
+  
+  safe_grep -RIn \
     --exclude-dir=".git" --exclude-dir="node_modules" --exclude-dir="vendor" \
     --exclude="*.min.js" --exclude="*.map" \
-    '(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{30,}|github_pat_[0-9A-Za-z_]{20,}|AIza[0-9A-Za-z\-_]{35}|-----BEGIN PRIVATE KEY-----|SECRET_KEY=|AWS_SECRET_ACCESS_KEY|BEGIN OPENSSH PRIVATE KEY)' \
-    . | head -n 10)"
+    "${GREP_EXCLUDES[@]}" \
+    -E "$pattern" . > "$tmpf" || true
 
-  if [[ -n "${hits}" ]]; then
+  if [[ -s "$tmpf" ]]; then
     sayc "${YELLOW}  Possible secrets detected [HIGH]${NC}"
     record_finding "HIGH" "CHECK 04" "Possible secret patterns detected"
-    echo "${hits}"
+    say ""
+    
+    # Group by file and show snippets
+    local shown=0
+    local current_file=""
+    
+    while IFS=: read -r file line_num matched_text && [[ $shown -lt 10 ]]; do
+      if [[ "$file" != "$current_file" ]]; then
+        current_file="$file"
+        report_snippet_finding "HIGH" "Possible Secret" "$file" "$pattern" \
+          "Action: Remove secret, rotate credentials, use env vars/secret manager"
+        shown=$((shown + 1))
+      fi
+    done < "$tmpf"
+    
     say "Actions:"
     say "  • Remove secrets from source"
     say "  • Rotate exposed credentials"
@@ -422,6 +708,7 @@ check_05_backup_artifacts() {
   local hits
   hits="$(find_cmd . \
     \( -path "./.git" -o -path "./node_modules" -o -path "./vendor" \) -prune -o \
+    "${FIND_EXCLUDES[@]}" \
     -type f \( -name "*.bak" -o -name "*.old" -o -name "*.backup" -o -name "*.tmp" -o -name "*~" \) \
     -print 2>/dev/null | head -n 10 || true)"
 
@@ -440,6 +727,7 @@ check_06_dotenv_files() {
   local hits
   hits="$(find_cmd . \
     \( -path "./.git" -o -path "./node_modules" -o -path "./vendor" \) -prune -o \
+    "${FIND_EXCLUDES[@]}" \
     -type f \( -name ".env" -o -name ".env.*" -o -name "*.env" \) -print 2>/dev/null | head -n 10 || true)"
 
   if [[ -n "${hits}" ]]; then
@@ -460,7 +748,7 @@ check_07_output_exposure() {
   fi
 
   if [[ -d "${OUTPUT_SCAN_DIR}/.git" ]]; then
-    sayc "${RED}🛑 Output contains .git directory [CRITICAL]${NC}"
+    sayc "${RED} CRITICAL: Output contains .git directory${NC}"
     record_finding "CRITICAL" "CHECK 07" "Output contains .git directory"
     say "Actions:"
     say "  • Ensure build output does not include .git"
@@ -469,16 +757,21 @@ check_07_output_exposure() {
     sayc "${GREEN} No .git directory inside output${NC}"
   fi
 
-  local hits
-  hits="$(
-    ( find_cmd "${OUTPUT_SCAN_DIR}" -type f -maxdepth 6 -print0 2>/dev/null \
-      | xargs_cmd -0 sh -c 'grep -Il "BEGIN \(RSA\|DSA\|EC\|OPENSSH\) PRIVATE KEY" -- "$1" 2>/dev/null || true' sh \
-    ) | head -n 5
-  )"
-  if [[ -n "${hits}" ]]; then
-    sayc "${RED}🛑 Output contains private key material [CRITICAL]${NC}"
+  local pattern='BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY'
+  local tmpf
+  tmpf="$(tmpfile output-keys)"
+  
+  find_cmd "${OUTPUT_SCAN_DIR}" -type f -maxdepth 6 -print0 2>/dev/null \
+    | xargs_cmd -0 grep_cmd -l -E "$pattern" 2>/dev/null > "$tmpf" || true
+
+  if [[ -s "$tmpf" ]]; then
+    sayc "${RED} CRITICAL: Output contains private key material${NC}"
     record_finding "CRITICAL" "CHECK 07" "Output contains private key material"
-    echo "${hits}"
+    say ""
+    
+    while IFS= read -r file; do
+      report_snippet_finding "CRITICAL" "Private Key in Output" "$file" "$pattern"
+    done < <(head -5 "$tmpf")
   fi
 }
 
@@ -488,14 +781,28 @@ check_08_mixed_content_output() {
     return 0
   fi
 
-  local mixed
-  mixed="$(safe_grep -RIn --exclude="*.map" -E 'href="http://|src="http://|url\("http://' "${OUTPUT_SCAN_DIR}" | head -n 10)"
-  if [[ -n "${mixed}" ]]; then
+  local pattern='(href="http://|src="http://|url\("http://)'
+  local tmpf
+  tmpf="$(tmpfile mixed-content)"
+  
+  safe_grep -RIn --exclude="*.map" -E "$pattern" "${OUTPUT_SCAN_DIR}" > "$tmpf" || true
+  
+  if [[ -s "$tmpf" ]]; then
     sayc "${YELLOW}  Mixed content references found [MEDIUM]${NC}"
     record_finding "MEDIUM" "CHECK 08" "Mixed content references in output"
-    echo "${mixed}"
-    say "Actions:"
-    say "  • Use https:// resources to avoid downgrade and blocking"
+    say ""
+    
+    # Show first occurrence in each file
+    local shown=0
+    local current_file=""
+    while IFS=: read -r file line_num matched && [[ $shown -lt 5 ]]; do
+      if [[ "$file" != "$current_file" ]]; then
+        current_file="$file"
+        report_snippet_finding "MEDIUM" "Mixed Content" "$file" "$pattern" \
+          "Action: Use https:// resources to avoid downgrade and blocking"
+        shown=$((shown + 1))
+      fi
+    done < "$tmpf"
   else
     sayc "${GREEN} No mixed content references found${NC}"
   fi
@@ -677,16 +984,16 @@ check_17_git_history_sensitive_ext() {
     return 0
   fi
 
-  local count tmpfile
-  tmpfile="$(tmpfile git-history-check)"
+  local count tmpf
+  tmpf="$(tmpfile git-history-check)"
   
   # Write matching filenames to temp file
   git_cmd log --all --oneline --name-only 2>/dev/null \
     | grep_cmd -E '\.(env|key|pem|p12|pfx|backup|bak)$' 2>/dev/null \
-    > "${tmpfile}" || true
+    > "${tmpf}" || true
   
   # Count lines in the temp file
-  count="$(wc -l < "${tmpfile}" 2>/dev/null | tr -d ' ')"
+  count="$(wc -l < "${tmpf}" 2>/dev/null | tr -d ' ')"
 
   if [[ "${count:-0}" -gt 0 ]]; then
     sayc "${YELLOW}  Found ${count} sensitive-file reference(s) in git history [MEDIUM]${NC}"
@@ -698,7 +1005,6 @@ check_17_git_history_sensitive_ext() {
     sayc "${GREEN}  No sensitive file extensions found in git history${NC}"
   fi
 }
-
 
 check_18_git_remote_http() {
   if [[ ! -d ".git" ]] || ! _has_cmd git; then
@@ -727,6 +1033,7 @@ check_19_sensitive_filenames() {
   local hits
   hits="$(find_cmd . \
     \( -path "./.git" -o -path "./node_modules" -o -path "./vendor" \) -prune -o \
+    "${FIND_EXCLUDES[@]}" \
     -type f \( -name "id_rsa" -o -name "id_ed25519" -o -name "*.pem" -o -name "*.p12" -o -name "*.pfx" \) \
     -print 2>/dev/null | head -n 10 || true)"
 
@@ -747,17 +1054,28 @@ check_20_output_js_key_exposure() {
     sayc "${BLUE}  No build output directory detected${NC}"
     return 0
   fi
-  local hits
-  hits="$(safe_grep -RInE --exclude="*.map" \
-    '(AIza[0-9A-Za-z\-_]{35}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{30,})' \
-    "${OUTPUT_SCAN_DIR}" | head -n 10)"
-  if [[ -n "${hits}" ]]; then
+  
+  local pattern='(AIza[0-9A-Za-z\-_]{35}|AKIA[0-9A-Z]{16}|xox[baprs]-[0-9A-Za-z-]{10,}|ghp_[0-9A-Za-z]{30,})'
+  local tmpf
+  tmpf="$(tmpfile output-keys-check)"
+  
+  safe_grep -RIn --exclude="*.map" -E "$pattern" "${OUTPUT_SCAN_DIR}" > "$tmpf" || true
+  
+  if [[ -s "$tmpf" ]]; then
     sayc "${YELLOW}  Possible API keys found in output JS/HTML [HIGH]${NC}"
     record_finding "HIGH" "CHECK 20" "Possible keys in output bundles"
-    echo "${hits}"
-    say "Actions:"
-    say "  • Remove keys from client-side bundles"
-    say "  • Use server-side or secure build-time injection"
+    say ""
+    
+    local shown=0
+    local current_file=""
+    while IFS=: read -r file line_num matched && [[ $shown -lt 5 ]]; do
+      if [[ "$file" != "$current_file" ]]; then
+        current_file="$file"
+        report_snippet_finding "HIGH" "Possible API Key in Bundle" "$file" "$pattern" \
+          "Action: Remove keys from client-side bundles, use server-side injection"
+        shown=$((shown + 1))
+      fi
+    done < "$tmpf"
   else
     sayc "${GREEN} No obvious keys in output bundles${NC}"
   fi
@@ -806,7 +1124,7 @@ check_24_exposed_configs_output() {
     \( -name ".env" -o -name "*.pem" -o -name "*.key" -o -name "*.p12" -o -name "*.pfx" -o -name "*.bak" -o -name "*.old" \) \
     -print 2>/dev/null | head -n 10 || true)"
   if [[ -n "${hits}" ]]; then
-    sayc "${RED}🛑 Sensitive config/key artifacts in output [CRITICAL]${NC}"
+    sayc "${RED} CRITICAL: Sensitive config/key artifacts in output${NC}"
     record_finding "CRITICAL" "CHECK 24" "Sensitive artifacts in output"
     echo "${hits}"
     say "Actions:"
@@ -821,14 +1139,20 @@ check_25_netlify_env_leak() {
     sayc "${BLUE}  netlify.toml not found${NC}"
     return 0
   fi
-  local hits
-  hits="$(safe_grep -nE '(API_KEY|SECRET|TOKEN|PASSWORD)\s*=' netlify.toml | head -n 10)"
-  if [[ -n "${hits}" ]]; then
+  
+  local pattern='(API_KEY|SECRET|TOKEN|PASSWORD)\s*='
+  local tmpf
+  tmpf="$(tmpfile netlify-secrets)"
+  
+  safe_grep -n -E "$pattern" netlify.toml > "$tmpf" || true
+  
+  if [[ -s "$tmpf" ]]; then
     sayc "${YELLOW}  Possible secrets in netlify.toml [HIGH]${NC}"
     record_finding "HIGH" "CHECK 25" "Possible secrets in netlify.toml"
-    echo "${hits}"
-    say "Actions:"
-    say "  • Move secrets to Netlify environment variables / secret store"
+    say ""
+    
+    report_snippet_finding "HIGH" "Possible Secret in Config" "netlify.toml" "$pattern" \
+      "Action: Move secrets to Netlify environment variables / secret store"
   else
     sayc "${GREEN} No obvious secrets in netlify.toml${NC}"
   fi
@@ -866,7 +1190,7 @@ check_28_astro_integrations() {
     return 0
   fi
   local hits
-  hits="$(safe_grep -RInE 'integrations\s*:\s*\[' astro.config.* | head -n 10)"
+  hits="$(safe_grep -RIn -E 'integrations\s*:\s*\[' astro.config.* | head -n 10)"
   if [[ -n "${hits}" ]]; then
     sayc "${BLUE}  Astro integrations detected (verify trusted) [LOW]${NC}"
     record_finding "LOW" "CHECK 28" "Astro integrations detected"
@@ -882,7 +1206,7 @@ check_29_eleventy_eval() {
     return 0
   fi
   local hits
-  hits="$(safe_grep -RInE --exclude-dir=".git" --exclude-dir="node_modules" 'eval\(|Function\(' . | head -n 10)"
+  hits="$(safe_grep -RIn --exclude-dir=".git" --exclude-dir="node_modules" -E 'eval\(|Function\(' . | head -n 10)"
   if [[ -n "${hits}" ]]; then
     sayc "${YELLOW}  Potential eval/Function usage found [MEDIUM]${NC}"
     record_finding "MEDIUM" "CHECK 29" "eval/Function usage detected"
@@ -910,6 +1234,7 @@ check_31_large_files() {
   local hits
   hits="$(find_cmd . \
     \( -path "./.git" -o -path "./node_modules" -o -path "./vendor" \) -prune -o \
+    "${FIND_EXCLUDES[@]}" \
     -type f -size +20M -print 2>/dev/null | head -n 10 || true)"
   if [[ -n "${hits}" ]]; then
     sayc "${YELLOW}  Large files detected (>20MB) [LOW]${NC}"
@@ -944,14 +1269,29 @@ check_34_actions_footguns() {
     sayc "${BLUE}  No .github/workflows directory${NC}"
     return 0
   fi
-  local hits
-  hits="$(safe_grep -RInE \
-    '(pull_request_target|curl[^|]*\|\s*(bash|sh)|wget[^|]*\|\s*(bash|sh)|\bset\s+-x\b|\benv\s*\||\bprintenv\b|secrets\.)' \
-    .github/workflows | head -n 50)"
-  if [[ -n "${hits}" ]]; then
+  
+  local pattern='(pull_request_target|curl[^|]*\|\s*(bash|sh)|wget[^|]*\|\s*(bash|sh)|\bset\s+-x\b|\benv\s*\||\bprintenv\b|secrets\.)'
+  local tmpf
+  tmpf="$(tmpfile workflow-footguns)"
+  
+  safe_grep -RIn -E "$pattern" .github/workflows > "$tmpf" || true
+  
+  if [[ -s "$tmpf" ]]; then
     sayc "${YELLOW}  Potential workflow foot-guns detected [MEDIUM]${NC}"
     record_finding "MEDIUM" "CHECK 34" "Workflow foot-guns detected (heuristic)"
-    echo "${hits}"
+    say ""
+    
+    # Show first few unique files
+    local shown=0
+    local current_file=""
+    while IFS=: read -r file line_num matched && [[ $shown -lt 3 ]]; do
+      if [[ "$file" != "$current_file" ]]; then
+        current_file="$file"
+        report_snippet_finding "MEDIUM" "Workflow Foot-gun" "$file" "$pattern"
+        shown=$((shown + 1))
+      fi
+    done < "$tmpf"
+    
     say "Actions:"
     say "  • Avoid pull_request_target unless you fully understand trust boundaries"
     say "  • Avoid curl|bash / wget|bash patterns"
@@ -968,13 +1308,13 @@ check_35_actions_pinning_permissions() {
   fi
 
   local unpinned writeall hasperms
-  unpinned="$(safe_grep -RInE '^\s*uses:\s*[^#]+@([A-Za-z0-9_.-]+)\s*$' .github/workflows \
-    | grep_cmd -vE '@[0-9a-f]{40}\b' 2>/dev/null \
-    | grep_cmd -vE 'uses:\s*\./' 2>/dev/null \
+  unpinned="$(safe_grep -RIn -E '^\s*uses:\s*[^#]+@([A-Za-z0-9_.-]+)\s*$' .github/workflows \
+    | grep_cmd -v -E '@[0-9a-f]{40}\b' 2>/dev/null \
+    | grep_cmd -v -E 'uses:\s*\./' 2>/dev/null \
     | head -n 50 || true)"
 
-  writeall="$(safe_grep -RInE '^\s*permissions:\s*write-all\b' .github/workflows | head -n 20)"
-  hasperms="$(safe_grep -RInE '^\s*permissions:\s*$' .github/workflows | head -n 5)"
+  writeall="$(safe_grep -RIn -E '^\s*permissions:\s*write-all\b' .github/workflows | head -n 20)"
+  hasperms="$(safe_grep -RIn -E '^\s*permissions:\s*$' .github/workflows | head -n 5)"
 
   if [[ -n "${unpinned}" ]]; then
     sayc "${YELLOW}  Actions not pinned to commit SHA [MEDIUM]${NC}"
@@ -1042,7 +1382,7 @@ check_38_csp_quality() {
     return 0
   fi
   local csp
-  csp="$(safe_grep -nE 'Content-Security-Policy' netlify.toml | head -n 3)"
+  csp="$(safe_grep -n -E 'Content-Security-Policy' netlify.toml | head -n 3)"
   if [[ -z "${csp}" ]]; then
     sayc "${YELLOW}  No Content-Security-Policy header found [LOW]${NC}"
     record_finding "LOW" "CHECK 38" "CSP missing"
@@ -1050,7 +1390,7 @@ check_38_csp_quality() {
     say "  • Add a CSP header (even a basic one) to reduce XSS impact"
   else
     sayc "${GREEN} CSP header found${NC}"
-    if echo "${csp}" | grep_cmd -qiE 'unsafe-inline|unsafe-eval' 2>/dev/null; then
+    if echo "${csp}" | grep_cmd -qi -E 'unsafe-inline|unsafe-eval' 2>/dev/null; then
       sayc "${YELLOW}  CSP includes unsafe-inline/unsafe-eval (review) [LOW]${NC}"
       record_finding "LOW" "CHECK 38" "CSP includes unsafe-*"
       echo "${csp}"
@@ -1067,10 +1407,10 @@ check_39_browser_headers() {
   fi
 
   local rp pp coop coep
-  rp="$(safe_grep -nE 'Referrer-Policy' netlify.toml | head -n 1)"
-  pp="$(safe_grep -nE 'Permissions-Policy' netlify.toml | head -n 1)"
-  coop="$(safe_grep -nE 'Cross-Origin-Opener-Policy' netlify.toml | head -n 1)"
-  coep="$(safe_grep -nE 'Cross-Origin-Embedder-Policy' netlify.toml | head -n 1)"
+  rp="$(safe_grep -n -E 'Referrer-Policy' netlify.toml | head -n 1)"
+  pp="$(safe_grep -n -E 'Permissions-Policy' netlify.toml | head -n 1)"
+  coop="$(safe_grep -n -E 'Cross-Origin-Opener-Policy' netlify.toml | head -n 1)"
+  coep="$(safe_grep -n -E 'Cross-Origin-Embedder-Policy' netlify.toml | head -n 1)"
 
   [[ -z "${rp}" ]] && sayc "${YELLOW}  Missing Referrer-Policy [LOW]${NC}" && record_finding "LOW" "CHECK 39" "Referrer-Policy missing" || sayc "${GREEN} Referrer-Policy present${NC}"
   [[ -z "${pp}" ]] && sayc "${YELLOW}  Missing Permissions-Policy [LOW]${NC}" && record_finding "LOW" "CHECK 39" "Permissions-Policy missing" || sayc "${GREEN} Permissions-Policy present${NC}"
@@ -1096,14 +1436,15 @@ check_40_robots_sitemap() {
   fi
 
   if [[ -f "${OUTPUT_SCAN_DIR}/sitemap.xml" ]]; then
+    local pattern='(draft|internal|admin|/\.env|/\.git)'
     local bad
-    bad="$(safe_grep -nE '(draft|internal|admin|/\.env|/\.git)' "${OUTPUT_SCAN_DIR}/sitemap.xml" | head -n 20)"
+    bad="$(safe_grep -n -E "$pattern" "${OUTPUT_SCAN_DIR}/sitemap.xml" | head -n 20)"
     if [[ -n "${bad}" ]]; then
       sayc "${YELLOW}  sitemap.xml includes potentially sensitive paths [MEDIUM]${NC}"
       record_finding "MEDIUM" "CHECK 40" "Sensitive paths in sitemap.xml"
-      echo "${bad}"
-      say "Actions:"
-      say "  • Exclude drafts/admin/internal paths from sitemap generation"
+      say ""
+      report_snippet_finding "MEDIUM" "Sensitive Path in Sitemap" "${OUTPUT_SCAN_DIR}/sitemap.xml" "$pattern" \
+        "Action: Exclude drafts/admin/internal paths from sitemap generation"
     else
       sayc "${GREEN} sitemap.xml looks sane (heuristic)${NC}"
     fi
@@ -1118,8 +1459,8 @@ check_41_storage_endpoints() {
     return 0
   fi
   local hits
-  hits="$(safe_grep -RInE --exclude="*.map" \
-    '(s3\.amazonaws\.com|\.s3\.amazonaws\.com|storage\.googleapis\.com|\.blob\.core\.windows\.net)' \
+  hits="$(safe_grep -RIn --exclude="*.map" \
+    -E '(s3\.amazonaws\.com|\.s3\.amazonaws\.com|storage\.googleapis\.com|\.blob\.core\.windows\.net)' \
     "${OUTPUT_SCAN_DIR}" | head -n 20)"
   if [[ -n "${hits}" ]]; then
     sayc "${YELLOW}  Cloud storage endpoints referenced in output [LOW]${NC}"
@@ -1138,8 +1479,8 @@ check_42_recon_breadcrumbs() {
     return 0
   fi
   local hits
-  hits="$(safe_grep -RInE --exclude="*.map" \
-    '(/wp-admin|/phpmyadmin|/admin\b|/graphql\b|/\.env\b|/\.git\b)' \
+  hits="$(safe_grep -RIn --exclude="*.map" \
+    -E '(/wp-admin|/phpmyadmin|/admin\b|/graphql\b|/\.env\b|/\.git\b)' \
     "${OUTPUT_SCAN_DIR}" | head -n 20)"
   if [[ -n "${hits}" ]]; then
     sayc "${YELLOW}  Potential recon breadcrumbs found in output [LOW]${NC}"
@@ -1153,17 +1494,28 @@ check_42_recon_breadcrumbs() {
 }
 
 check_43_exfil_indicators() {
-  local hits
-  hits="$(safe_grep -RInE --exclude-dir=".git" --exclude-dir="node_modules" \
-    '(webhook\.site|requestbin|ngrok\.io|hookdeck\.com|pipedream\.net|pastebin\.com|discord(app)?\.com/api/webhooks)' \
-    . | head -n 30)"
-  if [[ -n "${hits}" ]]; then
+  local pattern='(webhook\.site|requestbin|ngrok\.io|hookdeck\.com|pipedream\.net|pastebin\.com|discord(app)?\.com/api/webhooks)'
+  local tmpf
+  tmpf="$(tmpfile exfil-indicators)"
+  
+  safe_grep -RIn --exclude-dir=".git" --exclude-dir="node_modules" \
+    -E "$pattern" . > "$tmpf" || true
+    
+  if [[ -s "$tmpf" ]]; then
     sayc "${YELLOW}  Potential exfiltration endpoints referenced [MEDIUM]${NC}"
     record_finding "MEDIUM" "CHECK 43" "Possible exfil endpoints referenced"
-    echo "${hits}"
-    say "Actions:"
-    say "  • Confirm endpoints are intentional and not leftover test hooks"
-    say "  • Treat unexpected webhooks as a compromise indicator"
+    say ""
+    
+    local shown=0
+    local current_file=""
+    while IFS=: read -r file line_num matched && [[ $shown -lt 5 ]]; do
+      if [[ "$file" != "$current_file" ]]; then
+        current_file="$file"
+        report_snippet_finding "MEDIUM" "Potential Exfil Endpoint" "$file" "$pattern" \
+          "Action: Confirm endpoints are intentional, treat unexpected webhooks as compromise indicator"
+        shown=$((shown + 1))
+      fi
+    done < "$tmpf"
   else
     sayc "${GREEN} No common exfil endpoints detected${NC}"
   fi
@@ -1292,11 +1644,11 @@ fi
 EXIT_CODE=0
 
 if [[ "${CRITICAL}" -gt 0 ]]; then
-  sayc "${RED}🛑 One or more CRITICAL findings. Blocking.${NC}"
+  sayc "${RED} CRITICAL: One or more CRITICAL findings. Blocking.${NC}"
   EXIT_CODE=3
 elif [[ "${HIGH}" -gt 0 ]]; then
   sayc "${YELLOW}  One or more HIGH findings.${NC}"
-  sayc "${RED}🛑 Blocking on HIGH.${NC}"
+  sayc "${RED} Blocking on HIGH.${NC}"
   EXIT_CODE=2
 elif [[ "${MEDIUM}" -gt 0 || "${LOW}" -gt 0 ]]; then
   if [[ "${NON_INTERACTIVE}" -eq 1 ]]; then
@@ -1308,12 +1660,12 @@ elif [[ "${MEDIUM}" -gt 0 || "${LOW}" -gt 0 ]]; then
       sayc "${GREEN} Proceeding (user accepted risk).${NC}"
       EXIT_CODE=0
     else
-      sayc "${YELLOW}⛔ User declined. Blocking.${NC}"
+      sayc "${YELLOW} User declined. Blocking.${NC}"
       EXIT_CODE=1
     fi
   fi
 else
-  sayc "${GREEN} No findings. You’re clean.${NC}"
+  sayc "${GREEN} No findings. You're clean.${NC}"
   EXIT_CODE=0
 fi
 
