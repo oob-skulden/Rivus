@@ -520,7 +520,7 @@ If you need enterprise features, fork it. If you want to contribute, keep it sim
 - [**CHECKS.md**][checks] – Complete reference for all 45 security checks  
 - [**INTEGRATION.md**][integration] – Git hooks, CI/CD setup, and team adoption  
 - [**LICENSE**][license] – AGPL-3.0  
-- [**SECURITY.md**][security] – Things to be aware of
+- [**SECURITY.md**][security] – Security considerations, trust boundaries, and safe-usage guidance
 
 [checks]: CHECKS.md
 [integration]: INTEGRATION.md
